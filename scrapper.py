@@ -14,6 +14,7 @@ from pathlib import Path
 from collections import deque
 import queue
 import threading
+import csv
 
 # =====================================================
 # CONFIGURAÇÃO DE LOCKS E RECURSOS COMPARTILHADOS
@@ -332,28 +333,31 @@ def make_request(url: str, params: Optional[Dict] = None, timeout: int = 15,
                 proxies: Optional[Dict] = None, retries: int = 3) -> Optional[requests.Response]:
     """Request com retry exponential backoff otimizado"""
     for attempt in range(retries):
+        # Intervalo de 0,5s entre cada requisição
+        if attempt > 0:
+            time.sleep(1)
         if stop_processing.is_set() or goal_reached.is_set():
             return None
-            
         try:
+            logger.debug(f"🔎 [Tentativa {attempt+1}] Fazendo request para {url} com timeout 7s...")
             response = requests.get(url, params=params, timeout=timeout, 
                                   proxies=proxies, allow_redirects=True)
-            
+            logger.debug(f"🔎 [Tentativa {attempt+1}] Request finalizado para {url} - status {response.status_code}")
             if response.status_code == 429:
-                wait_time = min((2 ** attempt) + random.uniform(0, 1), 10)
-                logger.warning(f"⏱️ Rate limit - aguardando {wait_time:.2f}s")
+                # Espera fixa de 2 minutos em caso de rate limit
+                wait_time = 40
+                logger.warning(f"⏱️ Rate limit - aguardando {wait_time}s (tentativa {attempt+1})")
                 time.sleep(wait_time)
                 continue
-                
             response.raise_for_status()
             return response
-            
         except requests.RequestException as e:
+            logger.debug(f"🔌 [Tentativa {attempt+1}] RequestException: {e}")
             if attempt == retries - 1:
                 logger.debug(f"🔌 Request falhou após {retries} tentativas: {e}")
                 return None
-            time.sleep(min(0.5 * (attempt + 1), 3))
-    
+            # Backoff para outros erros (até 10s)
+            time.sleep(min(2 ** attempt, 10))
     return None
 
 def safe_save_jsonl(record: Dict[str, Any], filename: str) -> bool:
@@ -371,6 +375,51 @@ def safe_save_jsonl(record: Dict[str, Any], filename: str) -> bool:
             return True
         except Exception as e:
             logger.error(f"❌ Erro ao salvar em {filename}: {e}")
+            return False
+
+def flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '_') -> Dict[str, Any]:
+    """Achata dicionário aninhado para CSV"""
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        elif isinstance(v, list):
+            # Para listas, converte para string ou trata elementos individualmente
+            if v and isinstance(v[0], dict):
+                # Se é lista de dicionários, serializa como JSON
+                items.append((new_key, json.dumps(v, ensure_ascii=False)))
+            else:
+                # Se é lista simples, junta com vírgulas
+                items.append((new_key, ', '.join(map(str, v)) if v else ''))
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+def safe_save_csv(record: Dict[str, Any], filename: str, is_review: bool = False) -> bool:
+    """Salva record em CSV com cabeçalho automático"""
+    with file_lock:
+        try:
+            # Achata o dicionário para CSV
+            flat_record = flatten_dict(record)
+            
+            # Verifica se arquivo existe para decidir se escreve cabeçalho
+            file_exists = os.path.exists(filename)
+            
+            with open(filename, 'a', newline='', encoding='utf-8') as f:
+                if flat_record:
+                    writer = csv.DictWriter(f, fieldnames=flat_record.keys())
+                    
+                    # Escreve cabeçalho se arquivo não existe
+                    if not file_exists:
+                        writer.writeheader()
+                    
+                    writer.writerow(flat_record)
+                    f.flush()
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Erro ao salvar CSV em {filename}: {e}")
             return False
 
 def get_existing_appids(filename: str) -> Set[int]:
@@ -530,7 +579,8 @@ def get_app_reviews(appid: int, num_reviews: int, proxy_manager: ProxyManager) -
 def processar_um_jogo(app: Dict[str, Any], proxy_manager: ProxyManager, 
                      game_details_file: str, game_reviews_file: str, 
                      args: argparse.Namespace, cursor_manager: CursorManager,
-                     games_counter: ThreadSafeCounter) -> bool:
+                     games_counter: ThreadSafeCounter, 
+                     game_details_csv: str = None, game_reviews_csv: str = None) -> bool:
     """
     Processa um jogo com reserva atômica - TOTALMENTE THREAD-SAFE CORRIGIDO
     """
@@ -589,6 +639,10 @@ def processar_um_jogo(app: Dict[str, Any], proxy_manager: ProxyManager,
             cursor_manager.mark_processed(appid, success=False)
             return False
         
+        # Salva em CSV se a flag estiver ativa
+        if args.csv and game_details_csv:
+            safe_save_csv(details, game_details_csv, is_review=False)
+        
         # Processa reviews se solicitado
         reviews_saved = 0
         if args.max_reviews > 0 and not goal_reached.is_set():
@@ -600,6 +654,9 @@ def processar_um_jogo(app: Dict[str, Any], proxy_manager: ProxyManager,
                 review['appid'] = appid
                 if safe_save_jsonl(review, game_reviews_file):
                     reviews_saved += 1
+                    # Salva review em CSV se a flag estiver ativa
+                    if args.csv and game_reviews_csv:
+                        safe_save_csv(review, game_reviews_csv, is_review=True)
             
             logger.info(f"📝 {reviews_saved} reviews salvos para {appid}")
         
@@ -680,6 +737,9 @@ class ProgressTracker:
 # =====================================================
 
 def main(args=None):
+    # Garante que as pastas de dados existem
+    for folder in ['data/json', 'data/csv', 'data/state']:
+        os.makedirs(folder, exist_ok=True)
     """Função principal otimizada e thread-safe"""
     
     if args is None:
@@ -687,15 +747,41 @@ def main(args=None):
         parser.add_argument('--proxies', type=str, help='Arquivo com lista de proxies')
         parser.add_argument('--max_games', type=int, default=10, help='Número máximo de jogos válidos')
         parser.add_argument('--max_reviews', type=int, default=10, help='Reviews por jogo')
-        parser.add_argument('--cursor_file', type=str, default='scraper_cursor.txt')
+        parser.add_argument('--cursor_file', type=str, default='data/state/scraper_cursor.txt')
         parser.add_argument('--reset_cursor', action='store_true', help='Reseta cursor e recomeça')
-        parser.add_argument('--game_details_file', type=str, default='game_details.jsonl')
-        parser.add_argument('--game_reviews_file', type=str, default='game_reviews.jsonl')
+        parser.add_argument('--game_details_file', type=str, default='data/json/game_details.jsonl')
+        parser.add_argument('--game_reviews_file', type=str, default='data/json/game_reviews.jsonl')
+        parser.add_argument('--csv', action='store_true', help='Salva dados também em formato CSV')
         parser.add_argument('--parallel', action='store_true', help='Modo paralelo (recomendado)')
         parser.add_argument('--workers', type=int, default=8, help='Threads no modo paralelo')
         parser.add_argument('--batch_size', type=int, default=100, help='Tamanho do lote - REDUZIDO')
         parser.add_argument('--checkpoint_interval', type=int, default=25, help='Intervalo para salvar estado')
+        parser.add_argument('--filter', nargs='*', default=[], help='Filtros para priorizar jogos (popular, indie)')
+        parser.add_argument('--use_famous_list', action='store_true', help='Usa lista de AppIDs famosos do arquivo famous_appids.csv')
         args = parser.parse_args()
+
+    # Ajusta caminhos dos arquivos de estado
+    if not args.cursor_file.startswith('data/state/'):
+        args.cursor_file = os.path.join('data/state', os.path.basename(args.cursor_file))
+    # Ajusta arquivos de backup e progress no CursorManager
+    def adjust_state_path(path):
+        if not path.startswith('data/state/'):
+            return os.path.join('data/state', os.path.basename(path))
+        return path
+
+    # Ajusta caminhos dos arquivos de dados
+    if not args.game_details_file.startswith('data/json/'):
+        args.game_details_file = os.path.join('data/json', os.path.basename(args.game_details_file))
+    if not args.game_reviews_file.startswith('data/json/'):
+        args.game_reviews_file = os.path.join('data/json', os.path.basename(args.game_reviews_file))
+
+    # Define nomes dos arquivos CSV baseados nos arquivos JSONL
+    game_details_csv = None
+    game_reviews_csv = None
+    if args.csv:
+        game_details_csv = os.path.join('data/csv', os.path.basename(args.game_details_file).replace('.jsonl', '.csv'))
+        game_reviews_csv = os.path.join('data/csv', os.path.basename(args.game_reviews_file).replace('.jsonl', '.csv'))
+        logger.info(f"📊 Modo CSV ativado: {game_details_csv}, {game_reviews_csv}")
 
     # Validação e ajuste de argumentos
     args.max_games = max(1, args.max_games)
@@ -703,6 +789,14 @@ def main(args=None):
     args.workers = max(1, min(20, args.workers))
     args.checkpoint_interval = max(5, args.checkpoint_interval)
     args.batch_size = max(50, min(150, args.batch_size))  # Limita batch size
+    
+    # Define nomes dos arquivos CSV baseados nos arquivos JSONL
+    game_details_csv = None
+    game_reviews_csv = None
+    if args.csv:
+        game_details_csv = args.game_details_file.replace('.jsonl', '.csv')
+        game_reviews_csv = args.game_reviews_file.replace('.jsonl', '.csv')
+        logger.info(f"📊 Modo CSV ativado: {game_details_csv}, {game_reviews_csv}")
     
     logger.info(f"🚀 INICIANDO Steam Scraper Otimizado")
     logger.info(f"🎯 Meta: {args.max_games} jogos | Reviews: {args.max_reviews} por jogo")
@@ -722,12 +816,47 @@ def main(args=None):
     # Carrega estado anterior
     cursor_manager.load_state()
     
-    # Obtém lista de jogos
+    # ====== LISTA DE JOGOS FAMOSOS E INDIES DE ARQUIVO ======
+    famous_appids = set()
+    famous_games_dict = {}
+    if getattr(args, 'use_famous_list', False):
+        famous_appids_path = 'data/famous_appids.csv'
+        if os.path.exists(famous_appids_path):
+            with open(famous_appids_path, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if i == 0 and line.lower().startswith('game_name'):  # Ignora cabeçalho
+                        continue
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        name = parts[0]
+                        try:
+                            appid = int(parts[1])
+                        except ValueError:
+                            continue
+                        famous_appids.add(appid)
+                        famous_games_dict[appid] = name
+        else:
+            logger.warning(f"Arquivo de AppIDs famosos não encontrado: {famous_appids_path}")
+
     logger.info("📦 Obtendo lista de jogos da Steam...")
     all_games = get_all_game_list()
     if not all_games:
         logger.error("❌ Não foi possível obter a lista de jogos")
         return
+
+    for appid in famous_appids:
+        all_games.append({'appid': appid, 'name': famous_games_dict.get(appid, f'FamousApp_{appid}')})
+
+    # Remove duplicatas mantendo o primeiro encontrado
+    unique_games = {}
+    for g in all_games:
+        appid = g.get('appid')
+        if appid not in unique_games:
+            unique_games[appid] = g
+    all_games = list(unique_games.values())
 
     # Carrega App IDs existentes e atualiza cursor
     existing_details = get_existing_appids(args.game_details_file)
@@ -739,23 +868,62 @@ def main(args=None):
     
     # Filtra jogos restantes
     remaining_games = cursor_manager.get_remaining_games(all_games)
-    
+
+    # Garante que os jogos famosos estejam no início da lista, sem duplicados
+    seen_appids = set()
+    famous_games = []
+    other_games = []
+    for g in remaining_games:
+        appid = g.get('appid')
+        if appid in famous_appids and appid not in seen_appids:
+            famous_games.append(g)
+            seen_appids.add(appid)
+        elif appid not in seen_appids:
+            other_games.append(g)
+            seen_appids.add(appid)
+    remaining_games = famous_games + other_games
+
     if not remaining_games:
         logger.info("✅ Todos os jogos já foram processados!")
         return
-    
+
     # Ajusta meta
     games_already_found = cursor_manager.total_games_found
     games_needed = max(0, args.max_games - games_already_found)
-    
+
     logger.info(f"📊 Status: {games_already_found} já encontrados, {games_needed} ainda necessários")
-    
+
     if games_needed <= 0:
         logger.info("🎉 Meta já atingida!")
         return
-    
-    # Embaralha para distribuição aleatória
-    random.shuffle(remaining_games)
+
+    # ===== FILTROS DE PRIORIZAÇÃO =====
+    def filter_popular(games):
+        # Prioriza jogos com mais reviews (proxy de popularidade)
+        return sorted(games, key=lambda g: g.get('reviews', 0), reverse=True)
+
+    def filter_indie(games):
+        # Prioriza jogos com tag 'Indie' (se disponível)
+        return [g for g in games if 'Indie' in str(g.get('name', '') + str(g.get('genres', '')))]
+
+    # Aplica filtros conforme args.filter
+    filtered_games = remaining_games
+    for f in args.filter:
+        if f == 'popular':
+            filtered_games = filter_popular(filtered_games)
+        elif f == 'indie':
+            filtered_games = filter_indie(filtered_games)
+
+    # Se filtro indie vazio, volta para original
+    if 'indie' in args.filter and not filtered_games:
+        logger.warning('Nenhum jogo indie encontrado, usando lista original.')
+        filtered_games = remaining_games
+
+    # Se não houver filtro, embaralha normalmente
+    if not args.filter:
+        random.shuffle(filtered_games)
+
+    remaining_games = filtered_games
     
     # Inicializa controles CORRIGIDOS
     progress_tracker = ProgressTracker(args.max_games)
@@ -779,7 +947,8 @@ def main(args=None):
                     break
                 
                 if processar_um_jogo(app, proxy_manager, args.game_details_file, 
-                                   args.game_reviews_file, args, cursor_manager, games_counter):
+                                   args.game_reviews_file, args, cursor_manager, games_counter,
+                                   game_details_csv, game_reviews_csv):
                     logger.info(f"📈 Progresso: {games_counter.value}/{args.max_games} jogos")
                 
                 processed_count += 1
@@ -826,7 +995,9 @@ def main(args=None):
                             args.game_reviews_file,
                             args,
                             cursor_manager,
-                            games_counter
+                            games_counter,
+                            game_details_csv,
+                            game_reviews_csv
                         )
                         futures.append(future)
                     
